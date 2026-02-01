@@ -1,0 +1,5 @@
+# desktop
+home: 192.168.1.10
+
+# laptop
+comp: 192.168.1.11
