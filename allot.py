@@ -27,21 +27,22 @@ FILE_MODIFICATION_TIMEOUT = 2 * 60 * 60
 
 
 class NodeStatus(IntEnum):
-    DOWN     = auto()
-    CHECKING = auto()
-    UP       = auto()
+    DOWN          = auto()
+    UNINITIALISED = auto()
+    CHECKING      = auto()
+    UP            = auto()
 
 class TaskStatus(IntEnum):
-    NOT_STARTED = auto()
-    FINISHED    = auto()
+    NOT_STARTED   = auto()
+    FINISHED      = auto()
     RUNNING_EARLY = auto()
-    RUNNING     = auto()
-    STALLED     = auto()
+    RUNNING       = auto()
+    STALLED       = auto()
 
 class ClusterStatus(IntEnum):
     UNINITIALISED = auto()
-    RUNNING = auto()
-    FINISHED = auto()
+    RUNNING       = auto()
+    FINISHED      = auto()
 
 
 @dataclass
@@ -90,11 +91,9 @@ class Node:
         self.name = name
         self.address = address
         self.nproc = 0
-        self.status = NodeStatus.CHECKING
+        self.status = NodeStatus.UNINITIALISED
         self.status_process: subprocess.Popen | None = None
         self.tasks: list[Task] = tasks if tasks is not None else []
-        self.status_process = self.__send_command('nproc', stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        self.get_and_update_status()
 
 
     def to_dict(self) -> dict:
@@ -119,6 +118,7 @@ class Node:
     def from_dict(cls, data: dict):
         tasks = [Task.from_dict(t) for t in data['tasks']]
         obj: Node = cls(data['name'], data['address'], tasks)
+        obj.update_and_get_status()
         return obj
 
 
@@ -140,12 +140,17 @@ class Node:
         return process
 
 
-    def get_and_update_status(self) -> NodeStatus:
+    def update_and_get_status(self) -> NodeStatus:
 
         match self.status:
 
             case NodeStatus.DOWN:
                 return NodeStatus.DOWN
+            
+            case NodeStatus.UNINITIALISED:
+                self.status = NodeStatus.CHECKING
+                self.status_process = self.__send_command('nproc', stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                return NodeStatus.CHECKING
 
             case NodeStatus.CHECKING:
                 assert self.status_process is not None, "Status process should be defined"
@@ -215,6 +220,7 @@ class Node:
 class Cluster:
 
     NODE_TASK_DENSITY = 4
+    # TODO: VOLATILE = False
 
     def __init__(
         self,
@@ -249,6 +255,8 @@ class Cluster:
             raise Exception("Nodes must be defined through `nodes`, `node_list`, or `node_file`")
 
         if nodes is not None:
+            if self.nnodes > len(nodes):
+                raise Exception(f"Not enough nodes provided ({len(nodes)}) for requested number of nodes {self.nnodes}.")
             self.__init_nodes(nodes)
         if task_factory is not None:
             self.__assign_tasks_to_nodes(task_factory)
@@ -291,7 +299,7 @@ class Cluster:
             for local_id in range(self.ntasks_per_node):
                 proc_id = node_id * self.ntasks_per_node + local_id
                 conf = NodeTaskConfig(
-                    cpus_on_node=selected_node.nproc, node_name=selected_node.address,
+                    cpus_on_node=selected_node.nproc, node_name=selected_node.name,
                     local_id=local_id, node_id=node_id, proc_id=proc_id, output_dir=self.output_dir,
                     job_name=self.job_name)
                 task = func(conf)
@@ -300,7 +308,7 @@ class Cluster:
 
     def update_node_statuses(self):
         for node in self.nodes:
-            node.get_and_update_status()
+            node.update_and_get_status()
             for task in node.tasks:
                 if task.status in [TaskStatus.FINISHED, TaskStatus.STALLED]:
                     continue
@@ -308,7 +316,6 @@ class Cluster:
 
     def __set_params(self, ntasks = 0, nnodes = 0, ntasks_per_node = 0):
 
-        logger.info(f"setting parameters: {ntasks=}, {nnodes=}, {ntasks_per_node=}")
         has_ntasks = ntasks > 0
         has_nodes = nnodes > 0
         has_ntasks_per_node = ntasks_per_node > 0
@@ -342,6 +349,7 @@ class Cluster:
                 self.ntasks_per_node = ntasks_per_node
             case _:
                 raise Exception(f"Invalid parameter configuration: {ntasks=}, {nnodes=}, {ntasks_per_node=}")
+        logger.info(f"setting parameters: {self.ntasks=}, {self.nnodes=}, {self.ntasks_per_node=}")
 
 
     def __read_nodes_from_file(self, filepath: P) -> list[Node]:
@@ -368,10 +376,11 @@ class Cluster:
     def __init_nodes(self, nodes: list[Node]) -> int:
 
         logger.info("initialising nodes") 
-        nodes_to_check = nodes.copy()
+        nodes_to_check = nodes[:self.nnodes]
+        chunk = 0
         while len(nodes_to_check) > 0 and len(self.nodes) != self.nnodes:
             node = nodes_to_check.pop(0)
-            node_status = node.get_and_update_status()
+            node_status = node.update_and_get_status()
             match node_status:
                 case NodeStatus.DOWN:
                     logger.warning(f"node ({node.name}, {node.address}) is down")
@@ -379,8 +388,11 @@ class Cluster:
                 case NodeStatus.CHECKING:
                     nodes_to_check.append(node)
                 case NodeStatus.UP:
-                    logger.warning(f"node ({node.name}, {node.address}) is up")
+                    logger.info(f"node ({node.name}, {node.address}) is up")
                     self.nodes.append(node)
+            if len(nodes_to_check) == 0:
+                chunk += 1
+                nodes_to_check = nodes[(chunk*self.nnodes):((chunk+1)*self.nnodes)]
 
         if len(self.nodes) < self.nnodes:
             raise Exception(f"too few nodes available for the number of requested nodes ({len(self.nodes)} < {self.nnodes})")
